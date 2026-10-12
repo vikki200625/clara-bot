@@ -1,0 +1,18 @@
+name = "gf-bot"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# Created via: wrangler kv namespace create MEMORY  (fill id below after)
+kv_namespaces = [
+  { binding = "MEMORY", id = "84cf588ab512434887582ba92baba8d0" }
+]
+
+# Optional: lock the bot to your chat only. Get your id from @userinfobot,
+# then uncomment and redeploy.
+# [vars]
+# ALLOWED_CHAT_ID = "123456789"
+
+# Secrets (set with wrangler secret put <NAME>, never in chat):
+#   ZEN_KEY            - value of .opencode.key in ~/.local/share/opencode/auth.json
+#   TELEGRAM_BOT_TOKEN - from @BotFather
+#   TG_SECRET          - random string; also set as webhook secret_token

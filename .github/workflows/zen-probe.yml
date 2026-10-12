@@ -1,0 +1,71 @@
+name: zen-probe
+
+# Does OpenCode Zen's free tier accept requests from GitHub's runner IPs?
+# Cloudflare Worker IPs get FreeUsageLimitError 429; home IP works. This probe
+# answers "which cloud IPs are allowed" so we know where the bot can live.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show runner egress IP
+        run: curl -s https://api.ipify.org && echo
+
+      - name: Probe Zen with the gate recipe
+        env:
+          ZEN_KEY: ${{ secrets.ZEN_KEY }}
+        run: |
+          python3 - <<'PY'
+          import json, os, time, urllib.request, urllib.error, random, string
+
+          key = os.environ["ZEN_KEY"]
+          tools = json.load(open("gate-tools-full.json"))
+
+          def oc(p):
+              hx = format(int(time.time() * 0x1000), "x").zfill(12)[-12:]
+              rnd = "".join(random.choice(string.ascii_letters + string.digits) for _ in range(14))
+              return f"{p}_{hx}{rnd}"
+
+          body = json.dumps({
+              "model": "mimo-v2.6-flash-free",
+              "messages": [{"role": "user", "content": "reply with exactly: PONG"}],
+              "stream": True,
+              "tools": tools,
+              "tool_choice": "none",
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://opencode.ai/zen/v1/chat/completions",
+              data=body,
+              method="POST",
+              headers={
+                  "Content-Type": "application/json",
+                  "Authorization": f"Bearer {key}",
+                  "User-Agent": "opencode/cli/1.18.31/cli",
+                  "x-opencode-client": "cli",
+                  "x-opencode-project": "global",
+                  "x-opencode-request": oc("msg"),
+                  "x-opencode-session": oc("ses"),
+              },
+          )
+          t = time.time()
+          try:
+              r = urllib.request.urlopen(req, timeout=90)
+              txt = ""
+              for line in r:
+                  s = line.decode("utf-8", "replace").strip()
+                  if s.startswith("data:") and "[DONE]" not in s:
+                      try:
+                          txt += (json.loads(s[5:])["choices"][0].get("delta") or {}).get("content") or ""
+                      except Exception:
+                          pass
+              print(f"RESULT: HTTP {r.status} in {time.time()-t:.1f}s reply={txt[:60]!r}")
+          except urllib.error.HTTPError as e:
+              print(f"RESULT: HTTP {e.code} in {time.time()-t:.1f}s body={e.read().decode()[:200]}")
+          except Exception as e:
+              print(f"RESULT: ERR {type(e).__name__} {e} after {time.time()-t:.1f}s")
+          PY

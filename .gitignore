@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.wrangler/
+history.json
+offset
+env
+*.env
+TG_SECRET.txt
+*.log
