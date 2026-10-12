@@ -1,0 +1,68 @@
+name: clara
+
+# Clara lives here: this workflow polls Telegram and replies using the Zen free
+# brain. Each run serves for MAX_RUNTIME minutes, then dispatches the next run,
+# so the bot is online continuously. The cron is only a watchdog: if the chain
+# ever breaks, the next scheduled run starts a fresh one.
+#
+# Needs repo secrets: TELEGRAM_BOT_TOKEN, ZEN_KEY, MEM_SECRET (= wrangler TG_SECRET)
+# Needs repo variables: MEM_URL, ALLOWED_CHAT_IDS, GREET_ON_START
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: clara-live
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.check.outputs.go }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          others=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/clara.yml/runs?per_page=20" \
+            --jq "[.workflow_runs[] | select(.status==\"in_progress\" or .status==\"queued\") | select(.id != ${GITHUB_RUN_ID})] | length")
+          echo "other clara runs in flight: $others"
+          if [ "$others" -gt 0 ]; then echo "go=false" >> "$GITHUB_OUTPUT"; else echo "go=true" >> "$GITHUB_OUTPUT"; fi
+
+  clara:
+    needs: guard
+    if: needs.guard.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Report egress IP
+        run: 'echo "runner ip $(curl -s https://api.ipify.org)"'
+
+      - name: Poll Telegram and reply
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ZEN_KEY: ${{ secrets.ZEN_KEY }}
+          MEM_URL: ${{ vars.MEM_URL }}
+          MEM_SECRET: ${{ secrets.MEM_SECRET }}
+          ALLOWED_CHAT_IDS: ${{ vars.ALLOWED_CHAT_IDS }}
+          GREET_ON_START: ${{ github.event_name == 'workflow_dispatch' && vars.GREET_ON_START || '' }}
+          MAX_RUNTIME_MS: "1800000"
+        run: node clara-poller.mjs
+
+      - name: Chain the next run
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run clara.yml --repo "$GITHUB_REPOSITORY"

@@ -161,9 +161,26 @@ async function handleUpdate(update, env) {
   }
 }
 
+// Memory REST for the GitHub-hosted poller (clara-poller.mjs). The Actions
+// runner is ephemeral, so chat history lives in this KV instead. Guarded by
+// the same secret as the Telegram webhook; only hist: keys are reachable.
+async function memApi(req, env, key) {
+  if (req.headers.get("X-Clara-Mem") !== env.TG_SECRET) return new Response("no", { status: 403 });
+  if (!key.startsWith("hist:")) return new Response("bad key", { status: 400 });
+  if (req.method === "GET") return new Response((await env.MEMORY.get(key)) ?? "");
+  if (req.method === "PUT") {
+    const body = await req.text();
+    if (body) await env.MEMORY.put(key, body);
+    else await env.MEMORY.delete(key);
+    return new Response("ok");
+  }
+  return new Response("no", { status: 405 });
+}
+
 export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
+    if (url.pathname === "/mem") return memApi(req, env, url.searchParams.get("key") ?? "");
     if (req.method !== "POST" || url.pathname !== "/tg") return new Response("ok");
     if (req.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.TG_SECRET) {
       return new Response("no", { status: 403 });

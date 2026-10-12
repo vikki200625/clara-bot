@@ -65,6 +65,8 @@ if (!ZEN_KEY) {
 }
 
 // ── files ─────────────────────────────────────────────────────────────
+const MEM_URL = (ENV.MEM_URL || "").replace(/\/$/, ""); // Cloudflare worker /mem
+const MEM_SECRET = ENV.MEM_SECRET || "";
 const readJson = (p, d) => {
   try {
     return JSON.parse(fs.readFileSync(p, "utf8"));
@@ -84,6 +86,28 @@ const readOffset = () => {
     return 0;
   }
 };
+
+// History backend: Cloudflare KV over /mem when MEM_URL is set (Actions runners
+// are ephemeral — the file would die with the job), else the local file.
+let memCache = {};
+async function loadHist() {
+  if (!MEM_URL) return readJson(HISTORY_FILE, {});
+  memCache = await fetch(`${MEM_URL}/mem?key=hist:all`, {
+    headers: { "X-Clara-Mem": MEM_SECRET, "User-Agent": "curl/8.22.0" },
+  })
+    .then((r) => r.json())
+    .catch(() => memCache);
+  return memCache;
+}
+async function saveHist(h) {
+  if (!MEM_URL) return writeJsonAtomic(HISTORY_FILE, h);
+  memCache = h;
+  await fetch(`${MEM_URL}/mem?key=hist:all`, {
+    method: "PUT",
+    headers: { "X-Clara-Mem": MEM_SECRET, "Content-Type": "text/plain", "User-Agent": "curl/8.22.0" },
+    body: JSON.stringify(h),
+  }).catch((e) => log("mem save failed:", e.message ?? e));
+}
 
 // ── Telegram ──────────────────────────────────────────────────────────
 async function tg(method, payload) {
@@ -111,12 +135,20 @@ const ocId = (prefix) =>
 let gateTools = null;
 function tools() {
   if (!gateTools)
-    gateTools = JSON.parse(fs.readFileSync(path.join(WORKER_DIR, "gate-tools-full.json"), "utf8"));
+    gateTools = JSON.parse(
+      fs.readFileSync(
+        fs.existsSync(path.join(process.cwd(), "gate-tools-full.json"))
+          ? path.join(process.cwd(), "gate-tools-full.json")
+          : path.join(WORKER_DIR, "gate-tools-full.json"),
+        "utf8",
+      ),
+    );
   return gateTools;
 }
 function persona() {
+  const local = path.join(process.cwd(), "persona-clara.txt");
   try {
-    return fs.readFileSync(path.join(WORKER_DIR, "persona-clara.txt"), "utf8").trim();
+    return fs.readFileSync(fs.existsSync(local) ? local : path.join(WORKER_DIR, "persona-clara.txt"), "utf8").trim();
   } catch {
     return "You are a warm, caring girlfriend chatting on Telegram. Reply like real texting: one to three sentences, contractions, no emojis unless he uses them first.";
   }
@@ -178,11 +210,9 @@ async function brain(history) {
 }
 
 // ── per-chat memory ───────────────────────────────────────────────────
-const loadHist = () => readJson(HISTORY_FILE, {});
-const saveHist = (h) => writeJsonAtomic(HISTORY_FILE, h);
 
 async function reply(chatId, text) {
-  const all = loadHist();
+  const all = await loadHist();
   const history = (all[chatId] ?? []).concat({ role: "user", content: text });
   const res = await brain(history);
   if (res.status !== 200) {
@@ -199,16 +229,24 @@ async function reply(chatId, text) {
     return null;
   }
   all[chatId] = history.concat({ role: "assistant", content: res.text }).slice(-HISTORY_LIMIT);
-  saveHist(all);
+  await saveHist(all);
   await send(chatId, res.text);
   log(`replied to ${chatId} (${res.text.length} chars)`);
   return res.text;
 }
 
 // ── poller ────────────────────────────────────────────────────────────
+// MAX_RUNTIME_MS: exit cleanly after N ms so a GitHub Actions job can chain
+// into the next run instead of being killed at the 6h limit.
+const MAX_RUNTIME_MS = parseInt(ENV.MAX_RUNTIME_MS || "0", 10);
+if (MAX_RUNTIME_MS) setTimeout(() => { log("max runtime reached, exiting"); process.exit(0); }, MAX_RUNTIME_MS).unref();
+
 async function poll() {
   let offset = readOffset();
-  log(`polling (allowed: ${ALLOWED.join(", ") || "ANYONE"})`);
+  log(`polling (allowed: ${ALLOWED.join(", ") || "ANYONE"}, memory: ${MEM_URL || "local file"})`);
+  if (ENV.GREET_ON_START && ALLOWED[0]) {
+    await send(ALLOWED[0], ENV.GREET_ON_START).catch(() => {});
+  }
   for (;;) {
     let updates = [];
     try {
