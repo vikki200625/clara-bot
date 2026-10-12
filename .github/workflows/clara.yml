@@ -62,7 +62,7 @@ jobs:
         run: node clara-poller.mjs
 
       - name: Chain the next run
-        if: success()
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run clara.yml --repo "$GITHUB_REPOSITORY"

@@ -21,6 +21,9 @@ import path from "node:path";
 
 const HOME = os.homedir();
 const DIR = path.join(HOME, "gf-bot-local");
+try {
+  fs.mkdirSync(DIR, { recursive: true }); // absent on GitHub runners
+} catch {}
 const WORKER_DIR = path.join(HOME, "gf-bot-worker");
 const HISTORY_FILE = path.join(DIR, "history.json");
 const OFFSET_FILE = path.join(DIR, "offset");
@@ -263,7 +266,9 @@ async function poll() {
     }
     for (const u of updates) {
       offset = u.update_id + 1;
-      fs.writeFileSync(OFFSET_FILE, String(offset));
+      try {
+        fs.writeFileSync(OFFSET_FILE, String(offset));
+      } catch {} // never let state-file trouble drop a message
       const msg = u.message;
       const chatId = String(msg?.chat?.id ?? "");
       const text = (msg?.text ?? "").trim();
