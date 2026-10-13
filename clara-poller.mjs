@@ -225,8 +225,31 @@ async function zen(messages) {
   return { status: 200, text: out.trim() };
 }
 
-async function brain(history) {
-  const messages = [{ role: "system", content: persona() }, ...history];
+// Real clock for the persona's time-awareness lines. The system prompt gets
+// "[now: ... IST | you last replied N min ago]" prepended so counting/guilt
+// lines are true instead of guessed.
+const ts = (m) => (typeof m?.t === "number" ? m.t : Date.parse(m?.t ?? "")) || null;
+function timeContext(now, lastAssistantAt) {
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  }).format(new Date(now));
+  let line = `[now: ${fmt} IST`;
+  const last = ts({ t: lastAssistantAt });
+  if (last) line += ` | you last replied ${Math.max(0, Math.round((now - last) / 60000))} min ago`;
+  return line + `]`;
+}
+
+async function brain(history, context) {
+  const messages = [
+    { role: "system", content: (context ? context + "\n\n" : "") + persona() },
+    ...history.map(({ role, content }) => ({ role, content })),
+  ];
   let res = await zen(messages);
   if (res.status === 429) {
     log("zen 429, retrying in 20s");
@@ -240,8 +263,11 @@ async function brain(history) {
 
 async function reply(chatId, text) {
   const all = await loadHist();
-  const history = (all[chatId] ?? []).concat({ role: "user", content: text });
-  const res = await brain(history);
+  const prev = all[chatId] ?? [];
+  const now = Date.now();
+  const history = prev.concat({ role: "user", content: text, t: now });
+  const lastAssistantAt = [...prev].reverse().find((m) => m.role === "assistant")?.t ?? null;
+  const res = await brain(history, timeContext(now, lastAssistantAt));
   if (res.status !== 200) {
     const note =
       res.status === 429
@@ -255,7 +281,9 @@ async function reply(chatId, text) {
     log("brain returned empty text");
     return null;
   }
-  all[chatId] = history.concat({ role: "assistant", content: res.text }).slice(-HISTORY_LIMIT);
+  all[chatId] = history
+    .concat({ role: "assistant", content: res.text, t: Date.now() })
+    .slice(-HISTORY_LIMIT);
   await saveHist(all);
   await send(chatId, res.text);
   log(`replied to ${chatId} (${res.text.length} chars)`);
