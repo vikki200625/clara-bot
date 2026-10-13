@@ -245,9 +245,13 @@ function timeContext(now, lastAssistantAt) {
   return line + `]`;
 }
 
+const REPLY_RULE = "[reply limit: hard cap 4 lines, usually 1-2 — no walls of text, ever]";
 async function brain(history, context) {
   const messages = [
-    { role: "system", content: (context ? context + "\n\n" : "") + persona() },
+    {
+      role: "system",
+      content: [context, REPLY_RULE, persona()].filter(Boolean).join("\n\n"),
+    },
     ...history.map(({ role, content }) => ({ role, content })),
   ];
   let res = await zen(messages);
