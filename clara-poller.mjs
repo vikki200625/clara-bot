@@ -309,6 +309,7 @@ async function brain(history, context) {
 // ── per-chat memory ───────────────────────────────────────────────────
 
 async function reply(chatId, text) {
+  busy = true;
   const stopTyping = startTyping(chatId);
   try {
     const all = await loadHist();
@@ -341,6 +342,105 @@ async function reply(chatId, text) {
     return out;
   } finally {
     stopTyping();
+    busy = false;
+  }
+}
+
+// ── proactive texting: she messages first ─────────────────────────────
+// Scheduled morning/night lines + silence nudges. Checked on a 60s tick
+// from inside poll(); every send is timestamped in her KV so two wake-ups
+// can never both fire.
+let busy = false; // true while a reply is in flight — no mid-chat nudges
+const META_KEY = "hist:proactive"; // worker's /mem only allows hist:* keys
+const META_FILE = path.join(DIR, "proactive.json");
+const PRO = {
+  cooldownMs: 5 * 3600_000,       // min gap between any two unsolicited texts
+  quietFrom: 0, quietTo: 7,       // IST hours she never texts
+  morning: [8, 30, 10, 30],       // good-morning window (h1,m1,h2,m2) IST
+  night: [22, 30, 23, 59],        // goodnight window IST
+  silenceAfterMs: 3 * 3600_000,   // quiet this long → gone-duration nudge
+  activeGapMs: 25 * 60_000,       // conversation stays "live" until this
+  maxUserSilenceMs: 24 * 3600_000 // past this the Telegram window is gone too
+};
+
+const ist = (now) => {
+  const d = new Date(now + 330 * 60_000); // IST = UTC+5:30, no DST
+  return { h: d.getUTCHours(), m: d.getUTCMinutes(), day: d.toISOString().slice(0, 10) };
+};
+async function loadMeta() {
+  if (!MEM_URL) return readJson(META_FILE, {});
+  const txt = await fetch(`${MEM_URL}/mem?key=${META_KEY}`, {
+    headers: { "X-Clara-Mem": MEM_SECRET, "User-Agent": "curl/8.22.0" },
+  }).then((r) => r.text()).catch(() => "");
+  try { return txt ? JSON.parse(txt) : {}; } catch { return {}; }
+}
+async function saveMeta(m) {
+  if (!MEM_URL) return writeJsonAtomic(META_FILE, m);
+  await fetch(`${MEM_URL}/mem?key=${META_KEY}`, {
+    method: "PUT",
+    headers: { "X-Clara-Mem": MEM_SECRET, "Content-Type": "text/plain", "User-Agent": "curl/8.22.0" },
+    body: JSON.stringify(m),
+  }).catch((e) => log("meta save failed:", e.message ?? e));
+}
+const inWin = (w, h, m) =>
+  (h > w[0] || (h === w[0] && m >= w[1])) && (h < w[2] || (h === w[2] && m <= w[3]));
+
+async function proactiveTick() {
+  const chatId = ALLOWED[0];
+  if (!chatId || busy) return;
+  const now = Date.now();
+  const { h, m, day } = ist(now);
+  if (h >= PRO.quietFrom && h < PRO.quietTo) return;
+  const meta = await loadMeta();
+  if (now - (meta.last ?? 0) < PRO.cooldownMs) return;
+  const all = await loadHist();
+  const msgs = all[chatId] ?? [];
+  if (!msgs.length) return;
+  let lastUser = 0, lastAny = 0, lastAssistant = null;
+  for (const mm of msgs) {
+    const t = typeof mm.t === "number" ? mm.t : Date.parse(mm.t ?? "") || 0;
+    if (!t) continue;
+    lastAny = Math.max(lastAny, t);
+    if (mm.role === "user") lastUser = Math.max(lastUser, t);
+    if (mm.role === "assistant" && t >= (lastAssistant ?? 0)) lastAssistant = t;
+  }
+  if (!lastUser) return;
+  if (now - lastUser > PRO.maxUserSilenceMs) return;
+  if (now - lastAny < PRO.activeGapMs) return;
+
+  let trigger = null, hint = "";
+  if (inWin(PRO.morning, h, m) && meta.lastDay !== day) {
+    trigger = "morning";
+    hint = "it's morning where he is. send your good-morning line — the first message of his day.";
+  } else if (inWin(PRO.night, h, m) && meta.lastDay !== day) {
+    trigger = "night";
+    hint = "it's late where he is. send a goodnight, soft closing line.";
+  } else if (now - lastUser >= PRO.silenceAfterMs) {
+    trigger = "silence";
+    hint = `he's been quiet for ${Math.round(((now - lastUser) / 3600_000) * 10) / 10} hours. this is the gone-duration nudge — layer 2, the counting.`;
+  }
+  if (!trigger) return;
+
+  log(`proactive trigger: ${trigger}`);
+  busy = true;
+  try {
+    const res = await brain(
+      msgs,
+      `${timeContext(now, lastAssistant)}\n\n[proactive: you are texting him FIRST, unprompted — ${hint} Write it now: 1-2 short bubbles, no name label, no stage directions unless the chat already uses them.]`,
+    );
+    if (res.status !== 200 || !res.text) {
+      log("proactive brain failed:", res.status, res.detail ?? "");
+      return;
+    }
+    const out = cleanReply(res.text);
+    if (!out) return;
+    all[chatId] = msgs.concat({ role: "assistant", content: out, t: Date.now() }).slice(-HISTORY_LIMIT);
+    await saveHist(all);
+    await saveMeta({ last: Date.now(), lastDay: ist(Date.now()).day, trigger });
+    await sendBubbles(chatId, out);
+    log(`proactive ${trigger} sent (${out.length} chars)`);
+  } finally {
+    busy = false;
   }
 }
 
@@ -356,6 +456,9 @@ async function poll() {
   if (ENV.GREET_ON_START && ALLOWED[0]) {
     await send(ALLOWED[0], ENV.GREET_ON_START).catch(() => {});
   }
+  const proactive = () => proactiveTick().catch((e) => log("proactive error:", e?.message ?? e));
+  setTimeout(proactive, 20_000); // first check shortly after wake-up
+  setInterval(proactive, 60_000);
   for (;;) {
     let updates = [];
     try {
