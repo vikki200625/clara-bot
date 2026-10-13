@@ -130,10 +130,32 @@ async function send(chatId, text) {
 }
 
 // ── Zen brain (gate recipe, same as the Cloudflare worker) ────────────
+// OpenCode 1.19 gate: new UA, ascending msg_ ids, bit-inverted (descending)
+// ses_ ids. Copied from opencode-free-proxy/server.mjs — keep in sync.
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-const ocId = (prefix) =>
-  `${prefix}_${(BigInt(Date.now()) * 0x1000n).toString(16).padStart(12, "0").slice(-12)}` +
+const OC_UA = "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+const random14 = () =>
   Array.from({ length: 14 }, () => BASE62[Math.floor(Math.random() * 62)]).join("");
+const ocIdBytes = (v) => {
+  let out = "";
+  for (let w = 0; w < 6; w++)
+    out += Number((v >> BigInt(40 - 8 * w)) & 0xffn).toString(16).padStart(2, "0");
+  return out;
+};
+let _ascMs = 0, _ascK = 0, _descMs = 0, _descK = 0;
+const ocId = (prefix) => {
+  const now = Date.now();
+  if (now !== _ascMs) { _ascMs = now; _ascK = 0; }
+  _ascK++;
+  return `${prefix}_${ocIdBytes(BigInt(now) * 0x1000n + BigInt(_ascK))}${random14()}`;
+};
+const ocIdSession = () => {
+  const now = Date.now();
+  if (now !== _descMs) { _descMs = now; _descK = 0; }
+  _descK++;
+  const v = BigInt(now) * 0x1000n + BigInt(_descK);
+  return `ses_${ocIdBytes(~v)}${random14()}`;
+};
 
 let gateTools = null;
 function tools() {
@@ -158,16 +180,18 @@ function persona() {
 }
 
 async function zen(messages) {
+  const session = ocIdSession();
   const res = await fetch("https://opencode.ai/zen/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${ZEN_KEY}`,
-      "User-Agent": "opencode/cli/1.18.31/cli",
+      "User-Agent": OC_UA,
       "x-opencode-client": "cli",
       "x-opencode-project": "global",
       "x-opencode-request": ocId("msg"),
-      "x-opencode-session": ocId("ses"),
+      "x-opencode-session": session,
+      "x-opencode-session-id": session,
     },
     body: JSON.stringify({
       model: MODEL,
