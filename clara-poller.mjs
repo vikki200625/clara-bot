@@ -245,7 +245,19 @@ function timeContext(now, lastAssistantAt) {
   return line + `]`;
 }
 
-const REPLY_RULE = "[reply limit: hard cap 4 lines, usually 1-2 — no walls of text, ever]";
+const REPLY_RULE =
+  "[reply limit: hard cap 4 lines, usually 1-2 — no walls of text, ever]\n" +
+  "[format: no name labels (never 'clara:' or '**clara:**'), no quotes wrapping your message, no stage directions unless he starts them — send the message itself]";
+
+// Belt-and-braces: strip a self-applied label/quotes if the model adds one
+// anyway, so a raw "clara: ..." can never reach Telegram.
+function cleanReply(text) {
+  let t = (text ?? "").trim();
+  const label = /^\s*(?:\*\*)?(?:clara|sara)(?:\*\*)?\s*[:\-–—]\s*(?:\*\*)?\s*/i;
+  for (let i = 0; i < 3 && label.test(t); i++) t = t.replace(label, "").trim();
+  t = t.replace(/^[“"'`]+/, "").replace(/[”"'`]+$/, "");
+  return t.trim();
+}
 async function brain(history, context) {
   const messages = [
     {
@@ -285,13 +297,15 @@ async function reply(chatId, text) {
     log("brain returned empty text");
     return null;
   }
+  const out = cleanReply(res.text);
+  if (!out) return null;
   all[chatId] = history
-    .concat({ role: "assistant", content: res.text, t: Date.now() })
+    .concat({ role: "assistant", content: out, t: Date.now() })
     .slice(-HISTORY_LIMIT);
   await saveHist(all);
-  await send(chatId, res.text);
-  log(`replied to ${chatId} (${res.text.length} chars)`);
-  return res.text;
+  await send(chatId, out);
+  log(`replied to ${chatId} (${out.length} chars)`);
+  return out;
 }
 
 // ── poller ────────────────────────────────────────────────────────────
