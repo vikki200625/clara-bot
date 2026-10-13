@@ -129,6 +129,37 @@ async function send(chatId, text) {
   }
 }
 
+// ── typing indicator + natural multi-bubble texting ───────────────────
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Telegram's "typing…" expires after ~5s, so refresh it while she thinks.
+function startTyping(chatId) {
+  let stopped = false;
+  const tick = () => {
+    if (stopped) return;
+    tg("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+  };
+  tick();
+  const iv = setInterval(tick, 4500);
+  return () => { stopped = true; clearInterval(iv); };
+}
+
+// She texts like a person: each blank-line block is its own bubble, sent a
+// beat apart, with a typing flash in between.
+async function sendBubbles(chatId, text) {
+  const parts = text.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
+  const bubbles = parts.length ? parts : [text];
+  for (let i = 0; i < bubbles.length; i++) {
+    if (i) {
+      await sleep(700 + Math.random() * 1500);
+      tg("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+    }
+    for (const chunk of bubbles[i].match(/[\s\S]{1,4000}/g) ?? [bubbles[i]]) {
+      await tg("sendMessage", { chat_id: chatId, text: chunk });
+    }
+  }
+}
+
 // ── Zen brain (gate recipe, same as the Cloudflare worker) ────────────
 // OpenCode 1.19 gate: new UA, ascending msg_ ids, bit-inverted (descending)
 // ses_ ids. Copied from opencode-free-proxy/server.mjs — keep in sync.
@@ -278,34 +309,39 @@ async function brain(history, context) {
 // ── per-chat memory ───────────────────────────────────────────────────
 
 async function reply(chatId, text) {
-  const all = await loadHist();
-  const prev = all[chatId] ?? [];
-  const now = Date.now();
-  const history = prev.concat({ role: "user", content: text, t: now });
-  const lastAssistantAt = [...prev].reverse().find((m) => m.role === "assistant")?.t ?? null;
-  const res = await brain(history, timeContext(now, lastAssistantAt));
-  if (res.status !== 200) {
-    const note =
-      res.status === 429
-        ? "queue's jammed again, text me in a couple minutes?"
-        : `brain error ${res.status} — ${res.detail ?? ""}`;
-    log(`brain failed for ${chatId}:`, res.status, res.detail ?? "");
-    await send(chatId, note);
-    return null;
+  const stopTyping = startTyping(chatId);
+  try {
+    const all = await loadHist();
+    const prev = all[chatId] ?? [];
+    const now = Date.now();
+    const history = prev.concat({ role: "user", content: text, t: now });
+    const lastAssistantAt = [...prev].reverse().find((m) => m.role === "assistant")?.t ?? null;
+    const res = await brain(history, timeContext(now, lastAssistantAt));
+    if (res.status !== 200) {
+      const note =
+        res.status === 429
+          ? "queue's jammed again, text me in a couple minutes?"
+          : `brain error ${res.status} — ${res.detail ?? ""}`;
+      log(`brain failed for ${chatId}:`, res.status, res.detail ?? "");
+      await send(chatId, note);
+      return null;
+    }
+    if (!res.text) {
+      log("brain returned empty text");
+      return null;
+    }
+    const out = cleanReply(res.text);
+    if (!out) return null;
+    all[chatId] = history
+      .concat({ role: "assistant", content: out, t: Date.now() })
+      .slice(-HISTORY_LIMIT);
+    await saveHist(all);
+    await sendBubbles(chatId, out);
+    log(`replied to ${chatId} (${out.length} chars)`);
+    return out;
+  } finally {
+    stopTyping();
   }
-  if (!res.text) {
-    log("brain returned empty text");
-    return null;
-  }
-  const out = cleanReply(res.text);
-  if (!out) return null;
-  all[chatId] = history
-    .concat({ role: "assistant", content: out, t: Date.now() })
-    .slice(-HISTORY_LIMIT);
-  await saveHist(all);
-  await send(chatId, out);
-  log(`replied to ${chatId} (${out.length} chars)`);
-  return out;
 }
 
 // ── poller ────────────────────────────────────────────────────────────
