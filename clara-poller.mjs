@@ -98,7 +98,7 @@ if (argv[0] === "--say") {
 } else if (argv[0] === "--fake") {
   const chat = argv[1];
   const text = argv.slice(2).join(" ");
-  const out = await reply(chat, text);
+  const out = await reply(chat, text, { persist: false });
   console.log("reply returned:", JSON.stringify(out));
 } else if (argv[0] === "--test") {
   const res = await brain([{ role: "user", content: "say hi in three words" }]);
