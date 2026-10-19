@@ -5,7 +5,9 @@ name: clara
 # so the bot is online continuously. The cron is only a watchdog: if the chain
 # ever breaks, the next scheduled run starts a fresh one.
 #
-# Needs repo secrets: TELEGRAM_BOT_TOKEN, ZEN_KEY, MEM_SECRET (= wrangler TG_SECRET)
+# Needs repo secrets: TELEGRAM_BOT_TOKEN, ZEN_KEY, MEM_SECRET (= wrangler TG_SECRET),
+#   TG_API_ID, TG_API_HASH, TELEGRAM_SESSION (read-receipt listener; optional —
+#   without it the ladder falls back to time-based nudges)
 # Needs repo variables: MEM_URL, ALLOWED_CHAT_IDS, GREET_ON_START
 
 on:
@@ -49,6 +51,25 @@ jobs:
 
       - name: Report egress IP
         run: 'echo "runner ip $(curl -s https://api.ipify.org)"'
+
+      - name: Unit tests
+        run: node --test
+
+      - name: Read-receipt listener
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          MEM_URL: ${{ vars.MEM_URL }}
+          MEM_SECRET: ${{ secrets.MEM_SECRET }}
+          ALLOWED_CHAT_IDS: ${{ vars.ALLOWED_CHAT_IDS }}
+        run: |
+          if [ -z "$TELEGRAM_SESSION" ]; then
+            echo "TELEGRAM_SESSION secret missing — read-receipts disabled, ladder falls back to time-based nudges"
+            exit 0
+          fi
+          pip install --quiet telethon
+          python listener.py &
 
       - name: Poll Telegram and reply
         env:
