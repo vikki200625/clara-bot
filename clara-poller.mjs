@@ -1,62 +1,30 @@
 #!/usr/bin/env node
-// Clara — Telegram girlfriend bot, long-polling on this machine.
-// Brain: OpenCode Zen free tier (mimo-v2.6-flash-free) with the verified gate
-// recipe (stream:true + decoy "bash"/"read" tools + ses_/msg_ id headers).
-// Zen free tier only accepts calls from the home IP — Cloudflare Workers get
-// FreeUsageLimitError 429 — hence long polling here instead of the webhook.
+// Clara — Telegram girlfriend bot, long-polling.
+// Live path: GitHub Actions self-chaining workflow; also runnable anywhere.
+// Brain: OpenCode Zen free tier via the gate recipe (lib/gate.mjs).
+// Memory: Cloudflare KV through the worker /mem bridge (lib/memory.mjs).
 //
-// Env (see env file next to this script):
+// Env (state-dir env file locally, or repo secrets/vars on Actions):
 //   TELEGRAM_BOT_TOKEN  from @BotFather
 //   ZEN_KEY             optional; defaults to ~/.local/share/opencode/auth.json
 //   ALLOWED_CHAT_IDS    comma-separated; empty = anyone (not recommended)
+//   MEM_URL             worker base URL for KV bridge; empty = local files
+//   MEM_SECRET          X-Clara-Mem header value (= wrangler TG_SECRET)
 //
 // Usage:
-//   node bot.mjs               run the poller (systemd does this)
-//   node bot.mjs --say "hi"    one-shot send to first allowed chat (or --chat <id>)
-//   node bot.mjs --test        run the brain on a test prompt, don't touch Telegram
+//   node clara-poller.mjs            run the poller (workflow does this)
+//   node clara-poller.mjs --say "hi" one-shot send (use --chat <id>)
+//   node clara-poller.mjs --test     run the brain on a test prompt, no Telegram
+//   node clara-poller.mjs --fake <chatId> <text>   full inbound path by hand
 
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-
-const HOME = os.homedir();
-const DIR = path.join(HOME, "gf-bot-local");
-try {
-  fs.mkdirSync(DIR, { recursive: true }); // absent on GitHub runners
-} catch {}
-const WORKER_DIR = path.join(HOME, "gf-bot-worker");
-const HISTORY_FILE = path.join(DIR, "history.json");
-const OFFSET_FILE = path.join(DIR, "offset");
-const HISTORY_LIMIT = 24;
-const MODEL = "mimo-v2.6-flash-free";
-
-const log = (...a) => console.log(new Date().toISOString(), ...a);
-
-function readEnv() {
-  const env = { ...process.env };
-  const f = path.join(DIR, "env");
-  if (fs.existsSync(f)) {
-    for (const line of fs.readFileSync(f, "utf8").split("\n")) {
-      const m = line.match(/^\s*([A-Z_]+)\s*=\s*(.*)\s*$/);
-      if (m) env[m[1]] = m[2].replace(/^["']|["']$/g, "");
-    }
-  }
-  if (!env.ZEN_KEY) {
-    try {
-      env.ZEN_KEY = JSON.parse(
-        fs.readFileSync(path.join(HOME, ".local/share/opencode/auth.json"), "utf8"),
-      ).opencode.key;
-    } catch {}
-  }
-  return env;
-}
-const ENV = readEnv();
-const TOKEN = ENV.TELEGRAM_BOT_TOKEN;
-const ZEN_KEY = ENV.ZEN_KEY;
-const ALLOWED = (ENV.ALLOWED_CHAT_IDS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+import {
+  ALLOWED, GREET_ON_START, MAX_RUNTIME_MS, MEM_URL, TOKEN, ZEN_KEY, log,
+} from "./lib/config.mjs";
+import { readOffset, writeOffset } from "./lib/memory.mjs";
+import { reply } from "./lib/reply.mjs";
+import { proactiveTick } from "./lib/proactive.mjs";
+import { brain } from "./lib/brain.mjs";
+import { send, tg } from "./lib/telegram.mjs";
 
 if (!TOKEN) {
   console.error("TELEGRAM_BOT_TOKEN missing");
@@ -67,394 +35,16 @@ if (!ZEN_KEY) {
   process.exit(1);
 }
 
-// ── files ─────────────────────────────────────────────────────────────
-const MEM_URL = (ENV.MEM_URL || "").replace(/\/$/, ""); // Cloudflare worker /mem
-const MEM_SECRET = ENV.MEM_SECRET || "";
-const readJson = (p, d) => {
-  try {
-    return JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch {
-    return d;
-  }
-};
-const writeJsonAtomic = (p, data) => {
-  const tmp = p + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(data));
-  fs.renameSync(tmp, p);
-};
-const readOffset = () => {
-  try {
-    return parseInt(fs.readFileSync(OFFSET_FILE, "utf8").trim(), 10) || 0;
-  } catch {
-    return 0;
-  }
-};
-
-// History backend: Cloudflare KV over /mem when MEM_URL is set (Actions runners
-// are ephemeral — the file would die with the job), else the local file.
-let memCache = {};
-async function loadHist() {
-  if (!MEM_URL) return readJson(HISTORY_FILE, {});
-  memCache = await fetch(`${MEM_URL}/mem?key=hist:all`, {
-    headers: { "X-Clara-Mem": MEM_SECRET, "User-Agent": "curl/8.22.0" },
-  })
-    .then((r) => r.json())
-    .catch(() => memCache);
-  return memCache;
-}
-async function saveHist(h) {
-  if (!MEM_URL) return writeJsonAtomic(HISTORY_FILE, h);
-  memCache = h;
-  await fetch(`${MEM_URL}/mem?key=hist:all`, {
-    method: "PUT",
-    headers: { "X-Clara-Mem": MEM_SECRET, "Content-Type": "text/plain", "User-Agent": "curl/8.22.0" },
-    body: JSON.stringify(h),
-  }).catch((e) => log("mem save failed:", e.message ?? e));
-}
-
-// ── Telegram ──────────────────────────────────────────────────────────
-async function tg(method, payload) {
-  const r = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const j = await r.json().catch(() => ({}));
-  if (!j.ok) log(`tg ${method} failed:`, JSON.stringify(j).slice(0, 300));
-  return j;
-}
-async function send(chatId, text) {
-  for (const chunk of text.match(/[\s\S]{1,4000}/g) ?? [text]) {
-    await tg("sendMessage", { chat_id: chatId, text: chunk });
-  }
-}
-
-// ── typing indicator + natural multi-bubble texting ───────────────────
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// Telegram's "typing…" expires after ~5s, so refresh it while she thinks.
-function startTyping(chatId) {
-  let stopped = false;
-  const tick = () => {
-    if (stopped) return;
-    tg("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
-  };
-  tick();
-  const iv = setInterval(tick, 4500);
-  return () => { stopped = true; clearInterval(iv); };
-}
-
-// She texts like a person: each blank-line block is its own bubble, sent a
-// beat apart, with a typing flash in between.
-async function sendBubbles(chatId, text) {
-  const parts = text.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
-  const bubbles = parts.length ? parts : [text];
-  for (let i = 0; i < bubbles.length; i++) {
-    if (i) {
-      await sleep(700 + Math.random() * 1500);
-      tg("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
-    }
-    for (const chunk of bubbles[i].match(/[\s\S]{1,4000}/g) ?? [bubbles[i]]) {
-      await tg("sendMessage", { chat_id: chatId, text: chunk });
-    }
-  }
-}
-
-// ── Zen brain (gate recipe, same as the Cloudflare worker) ────────────
-// OpenCode 1.19 gate: new UA, ascending msg_ ids, bit-inverted (descending)
-// ses_ ids. Copied from opencode-free-proxy/server.mjs — keep in sync.
-const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-const OC_UA = "opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
-const random14 = () =>
-  Array.from({ length: 14 }, () => BASE62[Math.floor(Math.random() * 62)]).join("");
-const ocIdBytes = (v) => {
-  let out = "";
-  for (let w = 0; w < 6; w++)
-    out += Number((v >> BigInt(40 - 8 * w)) & 0xffn).toString(16).padStart(2, "0");
-  return out;
-};
-let _ascMs = 0, _ascK = 0, _descMs = 0, _descK = 0;
-const ocId = (prefix) => {
-  const now = Date.now();
-  if (now !== _ascMs) { _ascMs = now; _ascK = 0; }
-  _ascK++;
-  return `${prefix}_${ocIdBytes(BigInt(now) * 0x1000n + BigInt(_ascK))}${random14()}`;
-};
-const ocIdSession = () => {
-  const now = Date.now();
-  if (now !== _descMs) { _descMs = now; _descK = 0; }
-  _descK++;
-  const v = BigInt(now) * 0x1000n + BigInt(_descK);
-  return `ses_${ocIdBytes(~v)}${random14()}`;
-};
-
-let gateTools = null;
-function tools() {
-  if (!gateTools)
-    gateTools = JSON.parse(
-      fs.readFileSync(
-        fs.existsSync(path.join(process.cwd(), "gate-tools-full.json"))
-          ? path.join(process.cwd(), "gate-tools-full.json")
-          : path.join(WORKER_DIR, "gate-tools-full.json"),
-        "utf8",
-      ),
-    );
-  return gateTools;
-}
-function persona() {
-  const local = path.join(process.cwd(), "persona-clara.txt");
-  try {
-    return fs.readFileSync(fs.existsSync(local) ? local : path.join(WORKER_DIR, "persona-clara.txt"), "utf8").trim();
-  } catch {
-    return "You are a warm, caring girlfriend chatting on Telegram. Reply like real texting: one to three sentences, contractions, no emojis unless he uses them first.";
-  }
-}
-
-async function zen(messages) {
-  const session = ocIdSession();
-  const res = await fetch("https://opencode.ai/zen/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${ZEN_KEY}`,
-      "User-Agent": OC_UA,
-      "x-opencode-client": "cli",
-      "x-opencode-project": "global",
-      "x-opencode-request": ocId("msg"),
-      "x-opencode-session": session,
-      "x-opencode-session-id": session,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages,
-      stream: true,
-      tools: tools(),
-      tool_choice: "none",
-    }),
-  });
-  if (!res.ok) return { status: res.status, text: "", detail: (await res.text()).slice(0, 200) };
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
-  let out = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop();
-    for (const line of lines) {
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim();
-      if (data === "[DONE]") continue;
-      try {
-        const d = JSON.parse(data)?.choices?.[0]?.delta?.content;
-        if (typeof d === "string") out += d;
-      } catch {}
-    }
-  }
-  return { status: 200, text: out.trim() };
-}
-
-// Real clock for the persona's time-awareness lines. The system prompt gets
-// "[now: ... IST | you last replied N min ago]" prepended so counting/guilt
-// lines are true instead of guessed.
-const ts = (m) => (typeof m?.t === "number" ? m.t : Date.parse(m?.t ?? "")) || null;
-function timeContext(now, lastAssistantAt) {
-  const fmt = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "Asia/Kolkata",
-    weekday: "long",
-    day: "numeric",
-    month: "long",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: true,
-  }).format(new Date(now));
-  let line = `[now: ${fmt} IST`;
-  const last = ts({ t: lastAssistantAt });
-  if (last) line += ` | you last replied ${Math.max(0, Math.round((now - last) / 60000))} min ago`;
-  return line + `]`;
-}
-
-const REPLY_RULE =
-  "[reply limit: hard cap 4 lines, usually 1-2 — no walls of text, ever]\n" +
-  "[format: no name labels (never 'clara:' or '**clara:**'), no quotes wrapping your message, no stage directions unless he starts them — send the message itself]";
-
-// Belt-and-braces: strip a self-applied label/quotes if the model adds one
-// anyway, so a raw "clara: ..." can never reach Telegram.
-function cleanReply(text) {
-  let t = (text ?? "").trim();
-  const label = /^\s*(?:\*\*)?(?:clara|sara)(?:\*\*)?\s*[:\-–—]\s*(?:\*\*)?\s*/i;
-  for (let i = 0; i < 3 && label.test(t); i++) t = t.replace(label, "").trim();
-  t = t.replace(/^[“"'`]+/, "").replace(/[”"'`]+$/, "");
-  return t.trim();
-}
-async function brain(history, context) {
-  const messages = [
-    {
-      role: "system",
-      content: [context, REPLY_RULE, persona()].filter(Boolean).join("\n\n"),
-    },
-    ...history.map(({ role, content }) => ({ role, content })),
-  ];
-  let res = await zen(messages);
-  if (res.status === 429) {
-    log("zen 429, retrying in 20s");
-    await new Promise((r) => setTimeout(r, 20000));
-    res = await zen(messages);
-  }
-  return res;
-}
-
-// ── per-chat memory ───────────────────────────────────────────────────
-
-async function reply(chatId, text) {
-  busy = true;
-  const stopTyping = startTyping(chatId);
-  try {
-    const all = await loadHist();
-    const prev = all[chatId] ?? [];
-    const now = Date.now();
-    const history = prev.concat({ role: "user", content: text, t: now });
-    const lastAssistantAt = [...prev].reverse().find((m) => m.role === "assistant")?.t ?? null;
-    const res = await brain(history, timeContext(now, lastAssistantAt));
-    if (res.status !== 200) {
-      const note =
-        res.status === 429
-          ? "queue's jammed again, text me in a couple minutes?"
-          : `brain error ${res.status} — ${res.detail ?? ""}`;
-      log(`brain failed for ${chatId}:`, res.status, res.detail ?? "");
-      await send(chatId, note);
-      return null;
-    }
-    if (!res.text) {
-      log("brain returned empty text");
-      return null;
-    }
-    const out = cleanReply(res.text);
-    if (!out) return null;
-    all[chatId] = history
-      .concat({ role: "assistant", content: out, t: Date.now() })
-      .slice(-HISTORY_LIMIT);
-    await saveHist(all);
-    await sendBubbles(chatId, out);
-    log(`replied to ${chatId} (${out.length} chars)`);
-    return out;
-  } finally {
-    stopTyping();
-    busy = false;
-  }
-}
-
-// ── proactive texting: she messages first ─────────────────────────────
-// Scheduled morning/night lines + silence nudges. Checked on a 60s tick
-// from inside poll(); every send is timestamped in her KV so two wake-ups
-// can never both fire.
-let busy = false; // true while a reply is in flight — no mid-chat nudges
-const META_KEY = "hist:proactive"; // worker's /mem only allows hist:* keys
-const META_FILE = path.join(DIR, "proactive.json");
-const PRO = {
-  cooldownMs: 5 * 3600_000,       // min gap between any two unsolicited texts
-  quietFrom: 0, quietTo: 7,       // IST hours she never texts
-  morning: [8, 30, 10, 30],       // good-morning window (h1,m1,h2,m2) IST
-  night: [22, 30, 23, 59],        // goodnight window IST
-  silenceAfterMs: 3 * 3600_000,   // quiet this long → gone-duration nudge
-  activeGapMs: 25 * 60_000,       // conversation stays "live" until this
-  maxUserSilenceMs: 24 * 3600_000 // past this the Telegram window is gone too
-};
-
-const ist = (now) => {
-  const d = new Date(now + 330 * 60_000); // IST = UTC+5:30, no DST
-  return { h: d.getUTCHours(), m: d.getUTCMinutes(), day: d.toISOString().slice(0, 10) };
-};
-async function loadMeta() {
-  if (!MEM_URL) return readJson(META_FILE, {});
-  const txt = await fetch(`${MEM_URL}/mem?key=${META_KEY}`, {
-    headers: { "X-Clara-Mem": MEM_SECRET, "User-Agent": "curl/8.22.0" },
-  }).then((r) => r.text()).catch(() => "");
-  try { return txt ? JSON.parse(txt) : {}; } catch { return {}; }
-}
-async function saveMeta(m) {
-  if (!MEM_URL) return writeJsonAtomic(META_FILE, m);
-  await fetch(`${MEM_URL}/mem?key=${META_KEY}`, {
-    method: "PUT",
-    headers: { "X-Clara-Mem": MEM_SECRET, "Content-Type": "text/plain", "User-Agent": "curl/8.22.0" },
-    body: JSON.stringify(m),
-  }).catch((e) => log("meta save failed:", e.message ?? e));
-}
-const inWin = (w, h, m) =>
-  (h > w[0] || (h === w[0] && m >= w[1])) && (h < w[2] || (h === w[2] && m <= w[3]));
-
-async function proactiveTick() {
-  const chatId = ALLOWED[0];
-  if (!chatId || busy) return;
-  const now = Date.now();
-  const { h, m, day } = ist(now);
-  if (h >= PRO.quietFrom && h < PRO.quietTo) return;
-  const meta = await loadMeta();
-  if (now - (meta.last ?? 0) < PRO.cooldownMs) return;
-  const all = await loadHist();
-  const msgs = all[chatId] ?? [];
-  if (!msgs.length) return;
-  let lastUser = 0, lastAny = 0, lastAssistant = null;
-  for (const mm of msgs) {
-    const t = typeof mm.t === "number" ? mm.t : Date.parse(mm.t ?? "") || 0;
-    if (!t) continue;
-    lastAny = Math.max(lastAny, t);
-    if (mm.role === "user") lastUser = Math.max(lastUser, t);
-    if (mm.role === "assistant" && t >= (lastAssistant ?? 0)) lastAssistant = t;
-  }
-  if (!lastUser) return;
-  if (now - lastUser > PRO.maxUserSilenceMs) return;
-  if (now - lastAny < PRO.activeGapMs) return;
-
-  let trigger = null, hint = "";
-  if (inWin(PRO.morning, h, m) && meta.lastDay !== day) {
-    trigger = "morning";
-    hint = "it's morning where he is. send your good-morning line — the first message of his day.";
-  } else if (inWin(PRO.night, h, m) && meta.lastDay !== day) {
-    trigger = "night";
-    hint = "it's late where he is. send a goodnight, soft closing line.";
-  } else if (now - lastUser >= PRO.silenceAfterMs) {
-    trigger = "silence";
-    hint = `he's been quiet for ${Math.round(((now - lastUser) / 3600_000) * 10) / 10} hours. this is the gone-duration nudge — layer 2, the counting.`;
-  }
-  if (!trigger) return;
-
-  log(`proactive trigger: ${trigger}`);
-  busy = true;
-  try {
-    const res = await brain(
-      msgs,
-      `${timeContext(now, lastAssistant)}\n\n[proactive: you are texting him FIRST, unprompted — ${hint} Write it now: 1-2 short bubbles, no name label, no stage directions unless the chat already uses them.]`,
-    );
-    if (res.status !== 200 || !res.text) {
-      log("proactive brain failed:", res.status, res.detail ?? "");
-      return;
-    }
-    const out = cleanReply(res.text);
-    if (!out) return;
-    all[chatId] = msgs.concat({ role: "assistant", content: out, t: Date.now() }).slice(-HISTORY_LIMIT);
-    await saveHist(all);
-    await saveMeta({ last: Date.now(), lastDay: ist(Date.now()).day, trigger });
-    await sendBubbles(chatId, out);
-    log(`proactive ${trigger} sent (${out.length} chars)`);
-  } finally {
-    busy = false;
-  }
-}
-
-// ── poller ────────────────────────────────────────────────────────────
 // MAX_RUNTIME_MS: exit cleanly after N ms so a GitHub Actions job can chain
 // into the next run instead of being killed at the 6h limit.
-const MAX_RUNTIME_MS = parseInt(ENV.MAX_RUNTIME_MS || "0", 10);
-if (MAX_RUNTIME_MS) setTimeout(() => { log("max runtime reached, exiting"); process.exit(0); }, MAX_RUNTIME_MS).unref();
+if (MAX_RUNTIME_MS)
+  setTimeout(() => { log("max runtime reached, exiting"); process.exit(0); }, MAX_RUNTIME_MS).unref();
 
 async function poll() {
   let offset = readOffset();
   log(`polling (allowed: ${ALLOWED.join(", ") || "ANYONE"}, memory: ${MEM_URL || "local file"})`);
-  if (ENV.GREET_ON_START && ALLOWED[0]) {
-    await send(ALLOWED[0], ENV.GREET_ON_START).catch(() => {});
+  if (GREET_ON_START && ALLOWED[0]) {
+    await send(ALLOWED[0], GREET_ON_START).catch(() => {});
   }
   const proactive = () => proactiveTick().catch((e) => log("proactive error:", e?.message ?? e));
   setTimeout(proactive, 20_000); // first check shortly after wake-up
@@ -475,9 +65,7 @@ async function poll() {
     }
     for (const u of updates) {
       offset = u.update_id + 1;
-      try {
-        fs.writeFileSync(OFFSET_FILE, String(offset));
-      } catch {} // never let state-file trouble drop a message
+      writeOffset(offset); // non-fatal: never let state trouble drop a message
       const msg = u.message;
       const chatId = String(msg?.chat?.id ?? "");
       const text = (msg?.text ?? "").trim();
@@ -500,7 +88,7 @@ async function poll() {
 // ── one-shot modes ────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
 if (argv[0] === "--say") {
-  const chat = argv[argv.indexOf("--chat") + 1] && argv.includes("--chat") ? argv[argv.indexOf("--chat") + 1] : ALLOWED[0];
+  const chat = argv.includes("--chat") ? argv[argv.indexOf("--chat") + 1] : ALLOWED[0];
   if (!chat) {
     console.error("no chat id (use --chat or ALLOWED_CHAT_IDS)");
     process.exit(1);
@@ -508,7 +96,6 @@ if (argv[0] === "--say") {
   const j = await tg("sendMessage", { chat_id: chat, text: argv[1] });
   console.log(j.ok ? `sent to ${chat}` : "failed: " + JSON.stringify(j));
 } else if (argv[0] === "--fake") {
-  // self-test: run the full inbound path (brain + memory + send) by hand
   const chat = argv[1];
   const text = argv.slice(2).join(" ");
   const out = await reply(chat, text);
