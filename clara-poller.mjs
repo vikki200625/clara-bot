@@ -6,7 +6,7 @@
 //
 // Env (state-dir env file locally, or repo secrets/vars on Actions):
 //   TELEGRAM_BOT_TOKEN  from @BotFather
-//   ZEN_KEY             optional; defaults to ~/.local/share/opencode/auth.json
+//   NIM_KEY             NVIDIA NIM API key (from build.nvidia.com)
 //   ALLOWED_CHAT_IDS    comma-separated; empty = anyone (not recommended)
 //   MEM_URL             worker base URL for KV bridge; empty = local files
 //   MEM_SECRET          X-Clara-Mem header value (= wrangler TG_SECRET)
@@ -18,7 +18,7 @@
 //   node clara-poller.mjs --fake <chatId> <text>   full inbound path by hand
 
 import {
-  ALLOWED, GREET_ON_START, MAX_RUNTIME_MS, MEM_URL, TOKEN, ZEN_KEY, log,
+  ALLOWED, GREET_ON_START, MAX_RUNTIME_MS, MEM_URL, TOKEN, NIM_KEY, log,
 } from "./lib/config.mjs";
 import { readOffset, writeOffset } from "./lib/memory.mjs";
 import { reply } from "./lib/reply.mjs";
@@ -30,8 +30,8 @@ if (!TOKEN) {
   console.error("TELEGRAM_BOT_TOKEN missing");
   process.exit(1);
 }
-if (!ZEN_KEY) {
-  console.error("ZEN_KEY missing (and auth.json unreadable)");
+if (!NIM_KEY) {
+  console.error("NIM_KEY missing (set NVIDIA NIM API key)");
   process.exit(1);
 }
 

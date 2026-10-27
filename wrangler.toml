@@ -13,6 +13,6 @@ kv_namespaces = [
 # ALLOWED_CHAT_ID = "123456789"
 
 # Secrets (set with wrangler secret put <NAME>, never in chat):
-#   ZEN_KEY            - value of .opencode.key in ~/.local/share/opencode/auth.json
+#   NIM_KEY            - NVIDIA NIM API key (from build.nvidia.com)
 #   TELEGRAM_BOT_TOKEN - from @BotFather
 #   TG_SECRET          - random string; also set as webhook secret_token

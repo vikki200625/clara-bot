@@ -5,7 +5,7 @@ name: clara
 # so the bot is online continuously. The cron is only a watchdog: if the chain
 # ever breaks, the next scheduled run starts a fresh one.
 #
-# Needs repo secrets: TELEGRAM_BOT_TOKEN, ZEN_KEY, MEM_SECRET (= wrangler TG_SECRET),
+# Needs repo secrets: TELEGRAM_BOT_TOKEN, NIM_KEY, MEM_SECRET (= wrangler TG_SECRET),
 #   TG_API_ID, TG_API_HASH, TELEGRAM_SESSION (read-receipt listener; optional —
 #   without it the ladder falls back to time-based nudges)
 # Needs repo variables: MEM_URL, ALLOWED_CHAT_IDS, GREET_ON_START
@@ -74,7 +74,7 @@ jobs:
       - name: Poll Telegram and reply
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          ZEN_KEY: ${{ secrets.ZEN_KEY }}
+          NIM_KEY: ${{ secrets.NIM_KEY }}
           MEM_URL: ${{ vars.MEM_URL }}
           MEM_SECRET: ${{ secrets.MEM_SECRET }}
           ALLOWED_CHAT_IDS: ${{ vars.ALLOWED_CHAT_IDS }}
