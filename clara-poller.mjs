@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Clara — Telegram girlfriend bot, long-polling.
 // Live path: GitHub Actions self-chaining workflow; also runnable anywhere.
-// Brain: OpenCode Zen free tier via the gate recipe (lib/gate.mjs).
+// Brain: NVIDIA NIM via the gate recipe (lib/gate.mjs).
 // Memory: Cloudflare KV through the worker /mem bridge (lib/memory.mjs).
 //
 // Env (state-dir env file locally, or repo secrets/vars on Actions):
@@ -37,8 +37,18 @@ if (!NIM_KEY) {
 
 // MAX_RUNTIME_MS: exit cleanly after N ms so a GitHub Actions job can chain
 // into the next run instead of being killed at the 6h limit.
-if (MAX_RUNTIME_MS)
-  setTimeout(() => { log("max runtime reached, exiting"); process.exit(0); }, MAX_RUNTIME_MS).unref();
+// Graceful shutdown: stop polling, finish in-flight reply, then exit.
+let shuttingDown = false;
+if (MAX_RUNTIME_MS) {
+  setTimeout(() => {
+    log("max runtime reached, initiating graceful shutdown");
+    shuttingDown = true;
+  }, MAX_RUNTIME_MS).unref();
+}
+
+// Signal handlers for graceful shutdown
+process.on("SIGTERM", () => { log("SIGTERM received, shutting down"); shuttingDown = true; });
+process.on("SIGINT", () => { log("SIGINT received, shutting down"); shuttingDown = true; });
 
 async function poll() {
   let offset = readOffset();
@@ -50,6 +60,10 @@ async function poll() {
   setTimeout(proactive, 20_000); // first check shortly after wake-up
   setInterval(proactive, 60_000);
   for (;;) {
+    if (shuttingDown) {
+      log("shutdown flag set, exiting poll loop");
+      break;
+    }
     let updates = [];
     try {
       const r = await fetch(
@@ -85,6 +99,17 @@ async function poll() {
   }
 }
 
+// Wait for in-flight replies (busy flag) before exit
+async function waitForIdle() {
+  const { isBusy } = await import("./lib/reply.mjs");
+  let waited = 0;
+  while (isBusy() && waited < 10000) {
+    await new Promise((r) => setTimeout(r, 500));
+    waited += 500;
+  }
+  if (isBusy()) log("timeout waiting for in-flight reply to complete");
+}
+
 // ── one-shot modes ────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
 if (argv[0] === "--say") {
@@ -104,5 +129,5 @@ if (argv[0] === "--say") {
   const res = await brain([{ role: "user", content: "say hi in three words" }]);
   console.log("status:", res.status, "reply:", JSON.stringify(res.text), res.detail ?? "");
 } else {
-  poll();
+  poll().finally(waitForIdle).then(() => process.exit(0));
 }

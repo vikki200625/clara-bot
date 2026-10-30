@@ -1,7 +1,7 @@
 name: clara
 
-# Clara lives here: this workflow polls Telegram and replies using the Zen free
-# brain. Each run serves for MAX_RUNTIME minutes, then dispatches the next run,
+# Clara lives here: this workflow polls Telegram and replies using the NIM brain.
+# Each run serves for MAX_RUNTIME_MS, then dispatches the next run,
 # so the bot is online continuously. The cron is only a watchdog: if the chain
 # ever breaks, the next scheduled run starts a fresh one.
 #
@@ -55,7 +55,7 @@ jobs:
       - name: Unit tests
         run: node --test
 
-      - name: Read-receipt listener
+      - name: Read-receipt listener (supervised)
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -69,7 +69,20 @@ jobs:
             exit 0
           fi
           pip install --quiet telethon
-          python listener.py &
+          # Run listener in background but capture PID and output
+          python listener.py > listener.log 2>&1 &
+          LISTENER_PID=$!
+          echo "listener PID: $LISTENER_PID"
+          # Register cleanup trap
+          trap "kill $LISTENER_PID 2>/dev/null; echo 'listener stopped'; cat listener.log" EXIT
+          # Brief health check - wait a moment and verify it's still running
+          sleep 3
+          if ! kill -0 $LISTENER_PID 2>/dev/null; then
+            echo "listener died on startup:"
+            cat listener.log
+            exit 1
+          fi
+          echo "listener healthy, continuing..."
 
       - name: Poll Telegram and reply
         env:
