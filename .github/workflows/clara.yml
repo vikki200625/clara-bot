@@ -92,7 +92,7 @@ jobs:
           MEM_SECRET: ${{ secrets.MEM_SECRET }}
           ALLOWED_CHAT_IDS: ${{ vars.ALLOWED_CHAT_IDS }}
           GREET_ON_START: ${{ github.event_name == 'workflow_dispatch' && vars.GREET_ON_START || '' }}
-          MAX_RUNTIME_MS: "1800000"
+          MAX_RUNTIME_MS: ${{ vars.MAX_RUNTIME_MS }}
         run: node clara-poller.mjs
 
       - name: Chain the next run
